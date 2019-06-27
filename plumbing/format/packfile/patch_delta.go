@@ -1,8 +1,9 @@
 package packfile
 
 import (
+	"bytes"
 	"errors"
-	"io/ioutil"
+	"sync"
 
 	"gopkg.in/src-d/go-git.v4/plumbing"
 )
@@ -13,6 +14,18 @@ import (
 // for details about the delta format.
 
 const deltaSizeMin = 4
+
+var applyPool = sync.Pool{
+	New: func() interface{} {
+		return &bytes.Buffer{}
+	},
+}
+
+var patchPool = sync.Pool{
+	New: func() interface{} {
+		return ([]byte)(nil)
+	},
+}
 
 // ApplyDelta writes to target the result of applying the modification deltas in delta to base.
 func ApplyDelta(target, base plumbing.EncodedObject, delta []byte) error {
@@ -26,12 +39,23 @@ func ApplyDelta(target, base plumbing.EncodedObject, delta []byte) error {
 		return err
 	}
 
-	src, err := ioutil.ReadAll(r)
+	b := applyPool.Get().(*bytes.Buffer)
+	defer func() {
+		b.Reset()
+		applyPool.Put(b)
+	} ()
+	_, err = b.ReadFrom(r)
 	if err != nil {
 		return err
 	}
+	src := b.Bytes()
 
-	dst, err := PatchDelta(src, delta)
+	dst := patchPool.Get().([]byte)
+	defer func() {
+		dst = dst[:0]
+		patchPool.Put(dst)
+	} ()
+	dst, err = patchDelta(dst, src, delta)
 	if err != nil {
 		return err
 	}
@@ -51,6 +75,10 @@ var (
 // An error will be returned if delta is corrupted (ErrDeltaLen) or an action command
 // is not copy from source or copy from delta (ErrDeltaCmd).
 func PatchDelta(src, delta []byte) ([]byte, error) {
+	return patchDelta(nil, src, delta)
+}
+
+func patchDelta(dest, src, delta []byte) ([]byte, error) {
 	if len(delta) < deltaSizeMin {
 		return nil, ErrInvalidDelta
 	}
@@ -64,7 +92,9 @@ func PatchDelta(src, delta []byte) ([]byte, error) {
 	remainingTargetSz := targetSz
 
 	var cmd byte
-	dest := make([]byte, 0, targetSz)
+	if dest == nil {
+		dest = make([]byte, 0, targetSz)
+	}
 	for {
 		if len(delta) == 0 {
 			return nil, ErrInvalidDelta
